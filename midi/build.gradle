@@ -45,7 +45,7 @@ dependencies {
     implementation 'org.greenrobot:essentials:3.0.0-RC1'
     //    compile 'com.orhanobut:hawk:2.0.1'
     //    compile 'com.github.trikita:kv:e27a3127e3'
-    implementation 'com.github.disappointedpig:waspdb:1.1.2'
+    // implementation 'com.github.disappointedpig:waspdb:1.1.2' // WaspDB removed
 }
 
 

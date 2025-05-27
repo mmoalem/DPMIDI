@@ -5,8 +5,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import androidx.annotation.NonNull;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import android.content.pm.PackageManager;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
 import android.util.Log;
@@ -49,7 +54,9 @@ public class MainActivity extends AppCompatActivity {
         int position;
     }
 
+    private static final int REQUEST_CODE_POST_NOTIFICATIONS = 101;
     private IServiceFunctions service = null;
+    private java.util.concurrent.ExecutorService midiUiExecutor;
 
     private ServiceConnection svcConn = new ServiceConnection() {
         public void onServiceConnected(ComponentName className, IBinder binder) {
@@ -89,12 +96,30 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        requestNotificationPermission();
         setContentView(R.layout.activity_main);
         Toolbar toolbar = (Toolbar) findViewById(R.id.toolbar);
         setSupportActionBar(toolbar);
 
+        midiUiExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
+
         EventBus.getDefault().register(this);
-        MIDISession.getInstance().init(DPMIDIApplication.getAppContext());
+        final Context appContext = DPMIDIApplication.getAppContext();
+        midiUiExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                MIDISession.getInstance().init(appContext);
+                // If any UI update or action depended on init() completing,
+                // it would need to be posted back to the main thread.
+                // For example:
+                // runOnUiThread(new Runnable() {
+                //     @Override
+                //     public void run() {
+                //         // Update UI if needed after init
+                //     }
+                // });
+            }
+        });
 
         //start cms
         Intent startIntent = new Intent(MainActivity.this, ConnectionManagerService.class);
@@ -187,22 +212,46 @@ public class MainActivity extends AppCompatActivity {
         midiInviteButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                Bundle rinfo = new Bundle();
+                final Bundle rinfo = new Bundle();
                 rinfo.putString(MIDIConstants.RINFO_ADDR,"10.209.1.175");
                 rinfo.putInt(MIDIConstants.RINFO_PORT,5004);
                 rinfo.putBoolean(MIDIConstants.RINFO_RECON, useReconnect);
-                MIDISession.getInstance().connect(rinfo);
+                midiUiExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        MIDISession.getInstance().connect(rinfo);
+                        // Optionally update UI on main thread if needed
+                        // runOnUiThread(new Runnable() {
+                        //     @Override
+                        //     public void run() {
+                        //         midiConnectionStatusTextView.setText("Connection attempt sent...");
+                        //     }
+                        // });
+                    }
+                });
             }
         });
 
         midiEndConnectionButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                Bundle rinfo = new Bundle();
+                final Bundle rinfo = new Bundle();
                 rinfo.putString(MIDIConstants.RINFO_ADDR,"10.209.1.175");
                 rinfo.putInt(MIDIConstants.RINFO_PORT,5004);
                 rinfo.putBoolean(MIDIConstants.RINFO_RECON, useReconnect);
-                MIDISession.getInstance().disconnect(rinfo);
+                midiUiExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        MIDISession.getInstance().disconnect(rinfo);
+                        // Optionally update UI on main thread if needed
+                        // runOnUiThread(new Runnable() {
+                        //     @Override
+                        //     public void run() {
+                        //         midiConnectionStatusTextView.setText("Disconnection attempt sent...");
+                        //     }
+                        // });
+                    }
+                });
             }
         });
 
@@ -252,11 +301,29 @@ public class MainActivity extends AppCompatActivity {
     public void onDestroy() {
         super.onDestroy();
 
-        // Deactivate updates to us so that we dont get callbacks no more.
-        service.unregisterActivity(this);
+        EventBus.getDefault().unregister(this); // Unregister EventBus
+
+        if (service != null) { // Check if service is not null before unregistering
+            try {
+                // Deactivate updates to us so that we dont get callbacks no more.
+                service.unregisterActivity(this);
+            } catch (Throwable t) {
+                Log.e(TAG, "Error unregistering activity from service", t);
+            }
+        }
+
 
         // Finally stop the service
-        unbindService(svcConn);
+        try {
+            unbindService(svcConn);
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "Service not registered or already unbound: " + e.getMessage());
+        }
+
+
+        if (midiUiExecutor != null) {
+            midiUiExecutor.shutdown();
+        }
     }
 
     @Override
@@ -298,8 +365,12 @@ public class MainActivity extends AppCompatActivity {
         testMessage.putInt(MIDIConstants.MSG_CHANNEL,0);
         testMessage.putInt(MIDIConstants.MSG_NOTE,41);
         testMessage.putInt(MIDIConstants.MSG_VELOCITY,127);
-//        MIDIMessage m = MIDIMessage.newUsing(testMessage);
-        MIDISession.getInstance().sendMessage(testMessage);
+        midiUiExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                MIDISession.getInstance().sendMessage(testMessage);
+            }
+        });
 //        MIDISession.getInstance().sendMessage(41,127);
 //        MIDIMessage message = MIDISession.getInstance().sendNote(41,127);
 //        if(message != null) {
@@ -385,6 +456,35 @@ public class MainActivity extends AppCompatActivity {
         }
     };
 
+    private void requestNotificationPermission() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) { // API 33
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                // Consider showing a rationale dialog here if needed, explaining why the permission is important.
+                // For now, directly request it:
+                ActivityCompat.requestPermissions(this, new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, REQUEST_CODE_POST_NOTIFICATIONS);
+            } else {
+                // Permission already granted
+                Log.d("MainActivity", "POST_NOTIFICATIONS permission already granted.");
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_CODE_POST_NOTIFICATIONS) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                Log.d("MainActivity", "POST_NOTIFICATIONS permission granted by user.");
+                // Permission granted. You can proceed with actions that require notifications,
+                // though the service handles its own notification.
+            } else {
+                Log.w("MainActivity", "POST_NOTIFICATIONS permission denied by user.");
+                // Permission denied. Inform the user that notifications are beneficial for the app's foreground service.
+                // Maybe show a Toast or a Snackbar.
+                android.widget.Toast.makeText(this, "Notification permission denied. The MIDI service might not provide status updates correctly.", android.widget.Toast.LENGTH_LONG).show();
+            }
+        }
+    }
 }
 
 

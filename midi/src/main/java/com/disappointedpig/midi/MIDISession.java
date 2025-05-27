@@ -24,6 +24,7 @@ import com.disappointedpig.midi.events.MIDIReceivedEvent;
 import com.disappointedpig.midi.events.MIDISessionNameRegisteredEvent;
 import com.disappointedpig.midi.events.MIDISessionStartEvent;
 import com.disappointedpig.midi.events.MIDISessionStopEvent;
+import com.disappointedpig.midi.events.MIDIServiceDiscoveredEvent; // Import the new event
 import com.disappointedpig.midi.events.MIDISyncronizationCompleteEvent;
 import com.disappointedpig.midi.events.MIDISyncronizationStartEvent;
 import com.disappointedpig.midi.internal_events.AddressBookReadyEvent;
@@ -35,13 +36,14 @@ import com.disappointedpig.midi.internal_events.StreamConnectedEvent;
 import com.disappointedpig.midi.internal_events.StreamDisconnectEvent;
 import com.disappointedpig.midi.internal_events.SyncronizeStartedEvent;
 import com.disappointedpig.midi.internal_events.SyncronizeStoppedEvent;
-import com.esotericsoftware.kryo.KryoException;
-
-import net.rehacktive.waspdb.WaspDb;
-import net.rehacktive.waspdb.WaspFactory;
-import net.rehacktive.waspdb.WaspHash;
-import net.rehacktive.waspdb.WaspListener;
-import net.rehacktive.waspdb.WaspObserver;
+// WaspDB / Kryo specific imports removed
+// import com.esotericsoftware.kryo.KryoException;
+// import net.rehacktive.waspdb.WaspDb;
+// import net.rehacktive.waspdb.WaspFactory;
+// import net.rehacktive.waspdb.WaspHash;
+// import net.rehacktive.waspdb.WaspListener;
+// import net.rehacktive.waspdb.WaspObserver;
+import android.content.SharedPreferences; // Added for SharedPreferences
 
 import org.greenrobot.eventbus.EventBus;
 import org.greenrobot.eventbus.Subscribe;
@@ -75,9 +77,12 @@ public class MIDISession {
     private static String BONJOUR_SEPARATOR = ".";
     private static boolean DEBUG = true;
 
-    private WaspDb db;
-    private WaspHash midiAddressBook;
-    private WaspObserver observer;
+    // WaspDB members removed
+    // private WaspDb db;
+    // private WaspHash midiAddressBook;
+    // private WaspObserver observer;
+
+    private static final String MIDI_ADDRESS_BOOK_PREFS = "MidiAddressBookPrefs";
 
 
     private MIDISession() {
@@ -146,8 +151,11 @@ public class MIDISession {
             registered_eb = true;
         }
         if(!initialized) {
-            setupWaspDB();
-
+            // setupWaspDB(); // Replaced with direct SharedPreferences usage or a new setup method if complex
+            // For now, assume SharedPreferences is accessed directly when needed.
+            // Post AddressBookReadyEvent if other components rely on it after init.
+            EventBus.getDefault().post(new AddressBookReadyEvent());
+            Log.d(TAG, "AddressBook (Prefs) initialized, AddressBookReadyEvent posted.");
             initialized = true;
         }
     }
@@ -193,8 +201,11 @@ public class MIDISession {
         this.pendingStreams = new SparseArray<>(2);
         this.failedConnections = new ArrayMap<>(2);
         try {
-            initializeResolveListener();
-            registerService();
+            initializeResolveListener(); // Ensure this is called before discovery uses mResolveListener
+            initializeDiscoveryListener(); // Initialize our new discovery listener
+            registerService(); // Register our own service
+            // After successfully registering our service, start discovering others
+            discoverServices(); 
             isRunning = true;
             shouldBeRunning = false;
 
@@ -227,7 +238,8 @@ public class MIDISession {
             messageChannel.close(); // Redundant isListening = false, but good for clarity and future changes
         }
         isRunning = false;
-        shutdownNSDListener();
+        stopDiscovery(); // Stop discovering other services
+        shutdownNSDListener(); // Unregister our own service
         EventBus.getDefault().post(new MIDISessionStopEvent());
         // EventBus unregistration and network listener removal should be handled
         // by the component managing MIDISession instance, if this is a shared instance.
@@ -248,10 +260,11 @@ public class MIDISession {
             Log.d(TAG, "EventBus unregistered.");
         }
         // WaspDB cleanup if necessary, though typically managed by its own lifecycle
-        if (db != null) {
+        // if (db != null) {
             // db.close(); // If WaspDB has a close method
-            Log.d(TAG, "WaspDB resources would be released here if applicable.");
-        }
+            // Log.d(TAG, "WaspDB resources would be released here if applicable.");
+        // }
+        // No specific SharedPreferences cleanup needed here beyond context handling by Android
         midiSessionInstance = null; // Allow for potential re-creation if needed later
     }
 
@@ -922,8 +935,20 @@ public class MIDISession {
 
                 @Override
                 public void onServiceResolved(NsdServiceInfo serviceInfo) {
-                    Log.e(TAG, "Resolve Succeeded. " + serviceInfo);
+                    if (serviceInfo == null) {
+                        Log.w(TAG, "Resolved service info is null.");
+                        return;
+                    }
+                    InetAddress host = serviceInfo.getHost();
+                    int port = serviceInfo.getPort();
+                    String serviceName = serviceInfo.getServiceName();
 
+                    if (host != null && port > 0) {
+                        Log.i(TAG, "Service Resolved: Name: " + serviceName + ", Host: " + host.getHostAddress() + ", Port: " + port);
+                        EventBus.getDefault().post(new MIDIServiceDiscoveredEvent(serviceName, host, port));
+                    } else {
+                        Log.w(TAG, "Resolved service but host or port is invalid. Name: " + serviceName + " Host: " + host + " Port: " + port);
+                    }
                 }
             };
         }
@@ -931,16 +956,99 @@ public class MIDISession {
 
     private void shutdownNSDListener() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
-            try {
-                if (mNsdManager != null) {
-                    mNsdManager.unregisterService(mRegistrationListener);
+            if (mNsdManager != null) {
+                // Stop service registration
+                try {
+                    if (mRegistrationListener != null) { // Check if listener is not null
+                        mNsdManager.unregisterService(mRegistrationListener);
+                        Log.d(TAG, "Service unregistered.");
+                    }
+                } catch (IllegalArgumentException e) {
+                    Log.w(TAG, "Error unregistering service: " + e.getMessage());
                 }
-//            mNsdManager.stopServiceDiscovery(mDiscoveryListener);
-            } catch (IllegalArgumentException e) {
-                // absorb stupid listener not registered exception...
+                // Note: stopDiscovery() is called separately in stop() method now.
             }
         }
+    }
 
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    private void initializeDiscoveryListener() {
+        mDiscoveryListener = new NsdManager.DiscoveryListener() {
+            @Override
+            public void onDiscoveryStarted(String regType) {
+                Log.d(TAG, "Service discovery started: " + regType);
+            }
+
+            @Override
+            public void onServiceFound(NsdServiceInfo service) {
+                Log.i(TAG, "Service found: " + service.getServiceName() + " type: " + service.getServiceType());
+                if (service.getServiceType().equals(BONJOUR_TYPE)) {
+                    // Optionally, filter out own service if bonjourName is known and matches service.getServiceName()
+                    // if (service.getServiceName().equals(bonjourName)) {
+                    //    Log.d(TAG, "Own service found, not resolving.");
+                    // } else {
+                    Log.d(TAG, "Resolving service: " + service.getServiceName());
+                    if (mNsdManager != null && mResolveListener != null) { // Ensure mResolveListener is not null
+                        mNsdManager.resolveService(service, mResolveListener);
+                    } else {
+                        Log.w(TAG, "Cannot resolve service, NsdManager or mResolveListener is null.");
+                    }
+                    // }
+                }
+            }
+
+            @Override
+            public void onServiceLost(NsdServiceInfo service) {
+                Log.e(TAG, "Service lost: " + service.getServiceName());
+                // TODO: Handle service lost (e.g., remove from a list of available services)
+                // For now, just log. This might require an EventBus event.
+            }
+
+            @Override
+            public void onDiscoveryStopped(String serviceType) {
+                Log.i(TAG, "Discovery stopped: " + serviceType);
+            }
+
+            @Override
+            public void onStartDiscoveryFailed(String serviceType, int errorCode) {
+                Log.e(TAG, "Discovery failed to start: Error code " + errorCode + " for type " + serviceType);
+                // It's generally not recommended to call stopServiceDiscovery from within onStartDiscoveryFailed
+                // as it can lead to a loop if starting always fails.
+                // Consider a retry mechanism with backoff or disabling discovery for a period.
+            }
+
+            @Override
+            public void onStopDiscoveryFailed(String serviceType, int errorCode) {
+                Log.e(TAG, "Discovery failed to stop: Error code " + errorCode + " for type " + serviceType);
+            }
+        };
+    }
+
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    public void discoverServices() {
+        if (mNsdManager != null && mDiscoveryListener != null && isRunning) {
+            Log.d(TAG, "Starting service discovery for type: " + BONJOUR_TYPE);
+            try {
+                mNsdManager.discoverServices(BONJOUR_TYPE, NsdManager.PROTOCOL_DNS_SD, mDiscoveryListener);
+            } catch (IllegalArgumentException e) {
+                Log.e(TAG, "Error starting service discovery: " + e.getMessage());
+            }
+        } else {
+            Log.w(TAG, "Cannot start discovery - NsdManager, listener not initialized, or session not running.");
+        }
+    }
+
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    public void stopDiscovery() {
+        if (mNsdManager != null && mDiscoveryListener != null) {
+            Log.d(TAG, "Stopping service discovery.");
+            try {
+                mNsdManager.stopServiceDiscovery(mDiscoveryListener);
+            } catch (IllegalArgumentException e) {
+                // This can happen if discovery was not started or already stopped.
+                Log.w(TAG, "Error stopping service discovery: " + e.getMessage());
+            }
+        }
     }
 
     public String version() {
@@ -954,162 +1062,156 @@ public class MIDISession {
 
 
     // -------------------------------------------------
+    // SharedPreferences based Address Book implementation
 
-    public void setupWaspDB() {
-        String path = appContext.getFilesDir().getPath();
-        String databaseName = "MIDIAddressBook";
-        String password = "passw0rd";
-
-        WaspFactory.openOrCreateDatabase(path, databaseName, password, new WaspListener<WaspDb>() {
-            @Override
-            public void onDone(WaspDb waspDb) {
-                db = waspDb;
-                try {
-                    midiAddressBook = db.openOrCreateHash("midiAddressBook");
-                    if (midiAddressBook != null && midiAddressBook.getAllKeys() != null) {
-                        Log.d(TAG, "setupWaspDB - count " + midiAddressBook.getAllKeys().size());
-                        EventBus.getDefault().post(new AddressBookReadyEvent());
-                    }
-                } catch (KryoException e) {
-                    e.printStackTrace();
-                    Log.e(TAG,"remove and recreate midiAddressBook");
-                    db.removeHash("midiAddressBook");
-                    midiAddressBook = db.openOrCreateHash("midiAddressBook");
-                    Log.d(TAG, "setupWaspDB - count " + midiAddressBook.getAllKeys().size());
-                    EventBus.getDefault().post(new AddressBookReadyEvent());
-                }
-            }
-
-        });
-
-//            db = WaspFactory.openOrCreateDatabase(path, databaseName, password, new WaspListener<WaspDb>() {
-//                        @Override
-//                        public void onDone(WaspDb waspDb) {
-//                            Log.d("WaspFactoryINIT","on done?");
-//                        }
-//                    });
-    }
-
+    // setupWaspDB is removed. Initialization of SharedPreferences access will be on-demand.
 
     public Bundle getEntryFromAddressBook(String key) {
-        MIDIAddressBookEntry abe = midiAddressBook.get(key);
-        return abe.rinfo();
+        if (appContext == null || key == null) return null;
+        SharedPreferences prefs = appContext.getSharedPreferences(MIDI_ADDRESS_BOOK_PREFS, Context.MODE_PRIVATE);
+        // Check if a primary field like address exists for this key.
+        // Using a specific field like "_address" helps differentiate from other potential prefs.
+        String addressKey = key + "_address";
+        if (!prefs.contains(addressKey)) {
+            return null;
+        }
+
+        Bundle rinfo = new Bundle();
+        rinfo.putString(MIDIConstants.RINFO_ADDR, prefs.getString(addressKey, null));
+        rinfo.putInt(MIDIConstants.RINFO_PORT, prefs.getInt(key + "_port", 0));
+        rinfo.putBoolean(MIDIConstants.RINFO_RECON, prefs.getBoolean(key + "_reconnect", false));
+        rinfo.putString(MIDIConstants.RINFO_NAME, prefs.getString(key + "_name", "")); // Assuming name is stored
+
+        return rinfo;
     }
 
     public boolean addToAddressBook(Bundle rinfo) {
+        if (appContext == null || rinfo == null) return false;
         String key = rinfoToKey(rinfo);
+        if (key == null) return false;
 
-        Log.d(TAG,"addToAddressBook : "+key+" "+rinfo.toString());
-//        if(!rinfo.getBoolean(RINFO_RECON, false)) {
-//            // reinforce false (in case RECON isn't in bundle) - I guess I could
-//            // iterate over keySet - honestly, I don't know why I'm bothering to do this
-//            Log.d(TAG,"reinforce false?");
-//            rinfo.putBoolean(RINFO_RECON,false);
-//        }
+        SharedPreferences prefs = appContext.getSharedPreferences(MIDI_ADDRESS_BOOK_PREFS, Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = prefs.edit();
 
-        if(midiAddressBook.get(rinfoToKey(rinfo)) == null) {
-            boolean status = midiAddressBook.put(rinfoToKey(rinfo),new MIDIAddressBookEntry(rinfo));
-            if(status) {
-                Log.d(TAG,"status is good");
-                EventBus.getDefault().post(new MIDIAddressBookEvent());
-            }
+        editor.putString(key + "_address", rinfo.getString(MIDIConstants.RINFO_ADDR));
+        editor.putInt(key + "_port", rinfo.getInt(MIDIConstants.RINFO_PORT));
+        editor.putBoolean(key + "_reconnect", rinfo.getBoolean(MIDIConstants.RINFO_RECON, false));
+        editor.putString(key + "_name", rinfo.getString(MIDIConstants.RINFO_NAME, "")); // Store name
 
-        } else {
-            Log.d(TAG,"already in addressbook");
-            MIDIAddressBookEntry e =  midiAddressBook.get(rinfoToKey(rinfo));
-            e.setReconnect(rinfo.getBoolean(RINFO_RECON,e.getReconnect()));
-
-            boolean status = midiAddressBook.put(rinfoToKey(rinfo),e);
-            if(status) {
-                Log.d(TAG,"status is good - updated entry");
-                EventBus.getDefault().post(new MIDIAddressBookEvent());
-            }
+        boolean status = editor.commit(); // Using commit for immediate result, can switch to apply()
+        
+        if (status) {
+            Log.d(TAG, "addToAddressBook (Prefs): " + key + " Name: " + rinfo.getString(MIDIConstants.RINFO_NAME, ""));
+            EventBus.getDefault().post(new MIDIAddressBookEvent());
+            dumpAddressBook();
         }
-        Log.d(TAG,"about to dump ab");
-        dumpAddressBook();
-//        getAllAddressBook();
-        return true;
+        return status;
     }
 
     private String rinfoToKey(Bundle rinfo) {
-        return String.format(Locale.ENGLISH,"%1$s:%2$d",rinfo.getString(RINFO_ADDR),rinfo.getInt(RINFO_PORT,1234));
+        if (rinfo == null) return null;
+        String address = rinfo.getString(RINFO_ADDR);
+        int port = rinfo.getInt(RINFO_PORT, 0);
+        if (address == null || address.isEmpty() || port == 0) return null;
+        return String.format(Locale.ENGLISH,"%s:%d", address, port);
     }
 
-    public boolean addToAddressBook(MIDIAddressBookEntry m) {
-        if (midiAddressBook != null) {
-            return midiAddressBook.put(rinfoToKey(m.rinfo()),new MIDIAddressBookEntry(m.rinfo()));
-        }
-        return false;
+    // Overload for MIDIAddressBookEntry for convenience if used elsewhere
+    public boolean addToAddressBook(MIDIAddressBookEntry entry) {
+        if (entry == null) return false;
+        return addToAddressBook(entry.rinfo());
+    }
+    
+    public boolean deleteFromAddressBookByKey(String key) {
+        if (appContext == null || key == null) return false;
+        SharedPreferences prefs = appContext.getSharedPreferences(MIDI_ADDRESS_BOOK_PREFS, Context.MODE_PRIVATE);
+        Log.d(TAG, "deleteFromAddressBookByKey (Prefs): " + key);
+        SharedPreferences.Editor editor = prefs.edit();
+        editor.remove(key + "_address");
+        editor.remove(key + "_port");
+        editor.remove(key + "_reconnect");
+        editor.remove(key + "_name");
+        return editor.commit(); // Using commit for immediate result
     }
 
     public boolean deleteFromAddressBook(MIDIAddressBookEntry m) {
-        return midiAddressBook.remove(rinfoToKey(m.rinfo()));
-
+        if (m == null) return false;
+        return deleteFromAddressBookByKey(rinfoToKey(m.rinfo()));
     }
 
     public boolean addressBookIsEmpty() {
-        return midiAddressBook == null;
+        if (appContext == null) return true;
+        SharedPreferences prefs = appContext.getSharedPreferences(MIDI_ADDRESS_BOOK_PREFS, Context.MODE_PRIVATE);
+        return prefs.getAll().isEmpty(); // This might not be entirely accurate if unrelated keys are present
+                                        // A more robust check would iterate and see if any keys match our pattern.
+                                        // For now, this is a simpler approximation.
     }
 
     public ArrayList<MIDIAddressBookEntry> getAllAddressBook() {
-        Log.d(TAG,"getAllAddressBook");
-        if(midiAddressBook != null) {
-            HashMap<String, MIDIAddressBookEntry> hm = midiAddressBook.getAllData();
-            Log.d(TAG,"value count: "+hm.values().size());
-            Collection<MIDIAddressBookEntry> values = hm.values();
-            ArrayList<MIDIAddressBookEntry> list = new ArrayList<MIDIAddressBookEntry>(values);
+        ArrayList<MIDIAddressBookEntry> list = new ArrayList<>();
+        if (appContext == null) return list;
 
-            return list;
+        SharedPreferences prefs = appContext.getSharedPreferences(MIDI_ADDRESS_BOOK_PREFS, Context.MODE_PRIVATE);
+        Map<String, ?> allEntries = prefs.getAll();
+        java.util.Set<String> baseKeys = new java.util.HashSet<>();
+
+        for (String mapKey : allEntries.keySet()) {
+            if (mapKey.endsWith("_address")) { // Identify our entries by a known suffix
+                baseKeys.add(mapKey.substring(0, mapKey.lastIndexOf("_address")));
+            }
         }
-        return null;
+
+        for (String baseKey : baseKeys) {
+            Bundle rinfoBundle = new Bundle();
+            rinfoBundle.putString(MIDIConstants.RINFO_ADDR, prefs.getString(baseKey + "_address", null));
+            rinfoBundle.putInt(MIDIConstants.RINFO_PORT, prefs.getInt(baseKey + "_port", 0));
+            rinfoBundle.putBoolean(MIDIConstants.RINFO_RECON, prefs.getBoolean(baseKey + "_reconnect", false));
+            rinfoBundle.putString(MIDIConstants.RINFO_NAME, prefs.getString(baseKey + "_name", ""));
+
+            // Validate that essential parts were found
+            if (rinfoBundle.getString(MIDIConstants.RINFO_ADDR) != null) {
+                list.add(new MIDIAddressBookEntry(rinfoBundle));
+            }
+        }
+        Log.d(TAG, "getAllAddressBook (Prefs) count: " + list.size());
+        return list;
     }
 
-//    // whenever a connect is called, check addressbook to see if we need to
-//    // add RECON:true
-//    private void checkAddressBookForReconnect(Bundle rinfo) {
-//        Bundle abentry = getEntryFromAddressBook(rinfoToKey(rinfo));
-//        if(abentry != null) {
-//            Log.d(TAG,"checkAddressBookForReconnect : ");
-//            rinfo.putBoolean(RINFO_RECON,abentry.getBoolean(RINFO_RECON,false));
-//        }
-//    }
-
     private void dumpAddressBook() {
-        if(midiAddressBook != null) {
-            HashMap<String, MIDIAddressBookEntry> hm = midiAddressBook.getAllData();
-            Log.d(TAG, "-----------------------------------------");
-            for (String key : hm.keySet()) {
-                Log.d(TAG, " (" + key + ") : " + hm.get(key).getAddressPort());
-            }
-            Log.d(TAG, "-----------------------------------------");
-        } else {
-            Log.d(TAG, "-----------------MIDI Address Book null-------------");
-
+        if (appContext == null) {
+             Log.d(TAG, "-----------------MIDI Address Book (Prefs) - appContext null-------------");
+            return;
         }
+        ArrayList<MIDIAddressBookEntry> allEntries = getAllAddressBook();
+        Log.d(TAG, "-----------------MIDI Address Book (Prefs) Dump ("+allEntries.size()+")-------------------");
+        for (MIDIAddressBookEntry entry : allEntries) {
+            Bundle rinfo = entry.rinfo();
+            String key = rinfoToKey(rinfo);
+            Log.d(TAG, " (" + key + ") : Name: " + entry.getName() + ", Addr: " + entry.getAddressPort() + ", Recon: " + entry.getReconnect());
+        }
+        Log.d(TAG, "--------------------------------------------------------------");
     }
 
     public void checkAddressBookForReconnect() {
-        if(midiAddressBook != null) {
-            HashMap<String, MIDIAddressBookEntry> hm = midiAddressBook.getAllData();
-            Log.d(TAG, "-----------------------------------------");
-            for (String key : hm.keySet()) {
-                MIDIAddressBookEntry e = hm.get(key);
-
-                Log.d(TAG, " checking for reconnect - (" + key + ") : " + e.getAddressPort() + " "+(e.getReconnect() ? "YES" : "NO"));
-                if(e.getReconnect()) {
-                    connect(hm.get(key).rinfo());
-                    if (onSameNetwork(hm.get(key).getAddress())) {
-                        Log.d(TAG, " same network - (" + key + ") : " + hm.get(key).getAddressPort());
-                    } else {
-                        Log.d(TAG, " different network -  (" + key + ") : " + hm.get(key).getAddressPort());
-                    }
+        if (appContext == null) return;
+        ArrayList<MIDIAddressBookEntry> allEntries = getAllAddressBook();
+        Log.d(TAG, "-----------------Checking Address Book For Reconnect (Prefs) ("+allEntries.size()+")-------------------");
+        for (MIDIAddressBookEntry entry : allEntries) {
+            Log.d(TAG, " checking for reconnect - (" + rinfoToKey(entry.rinfo()) + ") : " + entry.getAddressPort() + " Recon: " + (entry.getReconnect() ? "YES" : "NO"));
+            if (entry.getReconnect()) {
+                // Ensure the rinfo bundle passed to connect also has the name if needed by connect logic or stream
+                Bundle rinfoToConnect = entry.rinfo(); 
+                // rinfoToConnect.putString(MIDIConstants.RINFO_NAME, entry.getName()); // Already in rinfo() from MIDIAddressBookEntry
+                connect(rinfoToConnect); 
+                // onSameNetwork check is fine as is
+                if (bonjourHost != null && netmask != null && onSameNetwork(entry.getAddress())) {
+                    Log.d(TAG, " same network - (" + rinfoToKey(entry.rinfo()) + ") : " + entry.getAddressPort());
+                } else {
+                    Log.d(TAG, " different network or network info unavailable - (" + rinfoToKey(entry.rinfo()) + ") : " + entry.getAddressPort());
                 }
             }
-            Log.d(TAG, "-----------------------------------------");
-        } else {
-            Log.d(TAG, "-----------------MIDI Address Book null-------------");
-
         }
+        Log.d(TAG, "----------------------------------------------------------------------");
     }
 
     public boolean onSameNetwork(String ip) {
