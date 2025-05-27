@@ -13,7 +13,7 @@ import android.net.nsd.NsdServiceInfo;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
-import android.support.v4.util.ArrayMap;
+import androidx.collection.ArrayMap;
 import android.util.Log;
 import android.util.SparseArray;
 
@@ -219,30 +219,43 @@ public class MIDISession {
         }
 
         if(controlChannel != null) {
-            controlChannel.stop();
+            controlChannel.stop(); // Sets isListening to false and wakes up selector
+            controlChannel.close(); // Redundant isListening = false, but good for clarity and future changes
         }
         if(messageChannel != null) {
-            messageChannel.stop();
+            messageChannel.stop(); // Sets isListening to false and wakes up selector
+            messageChannel.close(); // Redundant isListening = false, but good for clarity and future changes
         }
         isRunning = false;
         shutdownNSDListener();
         EventBus.getDefault().post(new MIDISessionStopEvent());
-
+        // EventBus unregistration and network listener removal should be handled
+        // by the component managing MIDISession instance, if this is a shared instance.
+        // For now, keeping them in a separate cleanup method or if instance is truly ending.
     }
 
-
-    public void finalize() {
-        stop();
+    /**
+     * Call this method when the MIDISession instance is no longer needed and is being destroyed.
+     * This ensures all resources are released.
+     */
+    public void cleanup() {
+        Log.d(TAG, "MIDISession cleanup called.");
+        stop(); // Ensures ports are stopped and closed
         removeNetworkListener();
-
-        registered_eb = false;
-        EventBus.getDefault().unregister(this);
-        try {
-            super.finalize();
-        } catch (Throwable throwable) {
-            throwable.printStackTrace();
+        if (registered_eb) {
+            EventBus.getDefault().unregister(this);
+            registered_eb = false;
+            Log.d(TAG, "EventBus unregistered.");
         }
+        // WaspDB cleanup if necessary, though typically managed by its own lifecycle
+        if (db != null) {
+            // db.close(); // If WaspDB has a close method
+            Log.d(TAG, "WaspDB resources would be released here if applicable.");
+        }
+        midiSessionInstance = null; // Allow for potential re-creation if needed later
     }
+
+    // Removed finalize() method. Cleanup should be explicit via cleanup().
 
     public void connect(final Bundle rinfo) {
         if(isRunning) {

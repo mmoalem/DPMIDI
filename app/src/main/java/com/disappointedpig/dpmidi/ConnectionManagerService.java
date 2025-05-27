@@ -21,7 +21,7 @@ import android.os.Looper;
 import android.os.PowerManager;
 import android.os.Process;
 import android.support.annotation.RequiresApi;
-import android.support.v4.app.NotificationCompat;
+import androidx.core.app.NotificationCompat;
 import android.util.Log;
 
 
@@ -48,6 +48,8 @@ public class ConnectionManagerService extends Service implements DPMIDIForegroun
     private boolean midiRunning = false;
     private static final String DEFAULT_BONJOUR_NAME = "testing";
 
+    private java.util.concurrent.ExecutorService midiSessionExecutor;
+
 
     public ConnectionManagerService() {
         Log.i(TAG, "--------------------------\n    init cms\n--------------------------\n");
@@ -63,6 +65,23 @@ public class ConnectionManagerService extends Service implements DPMIDIForegroun
     public void onCreate() {
         super.onCreate();
         Log.i(TAG, "onCreate ");
+        midiSessionExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
+    }
+
+    @Override
+    public void onDestroy() {
+        Log.i(TAG, "onDestroy");
+        if (midiSessionExecutor != null) {
+            midiSessionExecutor.shutdown();
+        }
+        // Ensure locks are released if held
+        if (wifiLock != null && wifiLock.isHeld()) {
+            wifiLock.release();
+        }
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+        }
+        super.onDestroy();
     }
 
     @Override
@@ -161,7 +180,7 @@ public class ConnectionManagerService extends Service implements DPMIDIForegroun
 //
 //        Bitmap icon = BitmapFactory.decodeResource(getResources(), R.mipmap.ic_launcher);
 //
-//        Notification notification = new android.support.v4.app.NotificationCompat.Builder(this)
+//        Notification notification = new androidx.core.app.NotificationCompat.Builder(this)
 //                .setContentTitle("StageCaller")
 //                .setTicker("StageCaller")
 //                .setContentText("stagecaller")
@@ -213,7 +232,7 @@ public class ConnectionManagerService extends Service implements DPMIDIForegroun
         } else {
             Bitmap icon = BitmapFactory.decodeResource(getResources(), R.mipmap.ic_launcher);
 
-            Notification notification = new android.support.v4.app.NotificationCompat.Builder(this)
+            Notification notification = new androidx.core.app.NotificationCompat.Builder(this)
                     .setContentTitle("StageCaller")
                     .setTicker("StageCaller")
                     .setContentText("stagecaller")
@@ -236,27 +255,41 @@ public class ConnectionManagerService extends Service implements DPMIDIForegroun
 
     @RequiresApi(Build.VERSION_CODES.O)
     private void startForegroundAPI27() {
+        String CHANNEL_ID = "com.disappointedpig.dpmidi.CONNECTION_MANAGER_CHANNEL";
+        String CHANNEL_NAME = "DPMIDI Connection Service";
 
-
-        String CHANNEL_ONE_ID = "com.disappointedpig.dpmidi.N1";
-        String CHANNEL_ONE_NAME = "Channel Testing";
-        NotificationChannel notificationChannel = null;
-
-        notificationChannel = new NotificationChannel(CHANNEL_ONE_ID, CHANNEL_ONE_NAME, IMPORTANCE_HIGH);
-        notificationChannel.enableLights(true);
-        notificationChannel.enableVibration(true);
-        notificationChannel.setLightColor(Color.RED);
-
+        NotificationChannel notificationChannel = new NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW);
+        notificationChannel.enableLights(false); // Low importance typically doesn't use lights/vibration
+        notificationChannel.enableVibration(false);
+        // notificationChannel.setLightColor(Color.RED); // Not needed for IMPORTANCE_LOW
         notificationChannel.setShowBadge(false);
-        notificationChannel.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
+        notificationChannel.setLockscreenVisibility(Notification.VISIBILITY_PRIVATE); // Or VISIBILITY_SECRET
 
         NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        manager.createNotificationChannel(notificationChannel);
+        if (manager != null) {
+            manager.createNotificationChannel(notificationChannel);
+        }
 
+        // Content Intent (to open MainActivity)
+        Intent mainActivityIntent = new Intent(this, MainActivity.class);
+        mainActivityIntent.setAction(Constants.ACTION.MAIN_ACTION);
+        mainActivityIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        PendingIntent pendingMainActivityIntent = PendingIntent.getActivity(this, 0, mainActivityIntent, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
-//        final NotificationCompat.Builder builder = new NotificationCompat.Builder(this,notificationChannel.getId());
-        Notification notification = new NotificationCompat.Builder(this,notificationChannel.getId()).build();
+        // Stop Service Action Button
+        Intent stopServiceIntent = new Intent(this, ConnectionManagerService.class);
+        stopServiceIntent.setAction(Constants.ACTION.STOPCMGR_ACTION);
+        PendingIntent pendingStopServiceIntent = PendingIntent.getService(this, 0, stopServiceIntent, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_CANCEL_CURRENT);
 
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("DPMIDI Service Active")
+                .setContentText("RTP-MIDI session is running.")
+                .setSmallIcon(R.mipmap.ic_launcher) // Using existing launcher icon, ideally replace with specific notification icon
+                .setOngoing(true)
+                .setContentIntent(pendingMainActivityIntent)
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop Service", pendingStopServiceIntent); // Using system icon
+
+        Notification notification = builder.build();
         startForeground(Constants.NOTIFICATION_ID.CONNECTIONMGR, notification);
     }
 
@@ -353,46 +386,73 @@ public class ConnectionManagerService extends Service implements DPMIDIForegroun
     }
 
     public void startMIDI() {
-
         setMIDIState(ConnectionState.STARTING);
+        final String bonjourName = DEFAULT_BONJOUR_NAME; // Effectively final for use in Runnable
+        final Context appContext = DPMIDIApplication.getAppContext(); // Effectively final
 
-        MIDISession midi = MIDISession.getInstance();
-        if(midi != null) {
-            midi.init(DPMIDIApplication.getAppContext());
-            midi.setBonjourName(DEFAULT_BONJOUR_NAME);
-            midi.start();
-            midiRunning = true;
-            setMIDIState(ConnectionState.RUNNING);
-
-        } else {
-            midiRunning = false;
-            setMIDIState(ConnectionState.FAILED);
-
-        }
-        checkLocks();
-        for (Activity client : clients.keySet()) {
-            updateClients(client);
-        }
+        midiSessionExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                MIDISession midi = MIDISession.getInstance();
+                if (midi != null) {
+                    midi.init(appContext); // Use captured context
+                    midi.setBonjourName(bonjourName);
+                    midi.start();
+                    // Post status updates back to the main thread
+                    new Handler(Looper.getMainLooper()).post(new Runnable() {
+                        @Override
+                        public void run() {
+                            midiRunning = true;
+                            setMIDIState(ConnectionState.RUNNING);
+                            checkLocks(); // UI related or affects service state, better on main or carefully managed
+                            for (Activity client : clients.keySet()) {
+                                updateClients(client);
+                            }
+                        }
+                    });
+                } else {
+                    new Handler(Looper.getMainLooper()).post(new Runnable() {
+                        @Override
+                        public void run() {
+                            midiRunning = false;
+                            setMIDIState(ConnectionState.FAILED);
+                            checkLocks();
+                            for (Activity client : clients.keySet()) {
+                                updateClients(client);
+                            }
+                        }
+                    });
+                }
+            }
+        });
     }
 
     public void stopMIDI() {
-        MIDISession midi = MIDISession.getInstance();
-        midiRunning = false;
-        setMIDIState(NOT_RUNNING);
-//        if(hbm != null) {
-//            hbm.stopHeartbeat();
-//        }
-
-        if(midi != null) {
-            midi.stop();
-        } else {
-            midiRunning = false;
-            setMIDIState(ConnectionState.FAILED);
-        }
-        checkLocks();
-        for (Activity client : clients.keySet()) {
-            updateClients(client);
-        }
+        midiSessionExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                MIDISession midi = MIDISession.getInstance();
+                if (midi != null) {
+                    midi.stop(); // This now calls close() on ports
+                    // midi.cleanup(); // Consider if MIDISession instance itself needs cleanup
+                                  // If cleanup() nullifies the instance, subsequent calls to getInstance()
+                                  // would create a new one, which might be desired or not.
+                                  // For now, only calling stop().
+                }
+                // Post status updates back to the main thread
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        midiRunning = false;
+                        setMIDIState(NOT_RUNNING);
+                        checkLocks(); // UI related or affects service state
+                        for (Activity client : clients.keySet()) {
+                            updateClients(client);
+                        }
+                    }
+                });
+            }
+        });
     }
 
 

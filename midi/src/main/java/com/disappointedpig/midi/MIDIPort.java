@@ -31,7 +31,7 @@ class MIDIPort implements Runnable {
     private Queue<DatagramPacket> outboundQueue;
 //    private Queue<DatagramPacket> inboundQueue;
 
-    private boolean isListening = false;
+    private volatile boolean isListening = false;
 
     private static final int BUFFER_SIZE = 1536;
     private static final String TAG = "MIDIPort";
@@ -64,34 +64,38 @@ class MIDIPort implements Runnable {
         }
     }
 
-    public void finalize() {
-        try {
-            isListening = false;
-            outboundQueue.clear();
-//            inboundQueue.clear();
-            selector.close();
-            channel.close();
-            thread.interrupt();
-        } catch (IOException e) {
-            e.printStackTrace();
+    public void close() {
+        Log.d(TAG, "Closing MIDIPort " + port);
+        isListening = false;
+        if (selector != null && selector.isOpen()) {
+            try {
+                selector.wakeup();
+            } catch (Exception e) { // Catches NullPointerException or ClosedSelectorException
+                Log.e(TAG, "Exception during selector.wakeup() on port " + port, e);
+            }
         }
-
-        try {
-            super.finalize();
-        } catch (Throwable throwable) {
-            throwable.printStackTrace();
-        }
+        // Thread joining should ideally be managed by the creator of MIDIPort,
+        // but we ensure the loop in run() terminates.
     }
 
     @Override
     public void run() {
-        while(isListening) {
-            try {
-                selector.select();
-                Set<SelectionKey> readyKeys = selector.selectedKeys();
-                if (readyKeys.isEmpty() ) {
-                    break;
-                } else {
+        try {
+            while(isListening) {
+                try {
+                    if (selector == null || !selector.isOpen()) {
+                        Log.w(TAG, "Selector is null or closed on port " + port + ", exiting run loop.");
+                        isListening = false; // Ensure loop terminates
+                        break;
+                    }
+                    selector.select(); // Can throw IOException or ClosedSelectorException
+                    if (!isListening) { // Check again after select() returns, in case close() was called
+                        break;
+                    }
+                    Set<SelectionKey> readyKeys = selector.selectedKeys();
+                    if (readyKeys.isEmpty() && isListening) { // Check isListening, select() might return if woken up
+                        continue; 
+                    }
                     Iterator<SelectionKey> keyIter = readyKeys.iterator();
                     while (keyIter.hasNext()) {
                         SelectionKey key = keyIter.next();
@@ -107,12 +111,36 @@ class MIDIPort implements Runnable {
                             handleWrite(key);
                         }
                     }
+                } catch (java.nio.channels.ClosedSelectorException e) {
+                    Log.w(TAG, "Selector closed on port " + port + ", exiting run loop.", e);
+                    isListening = false; // Ensure loop terminates
+                } catch (IOException e) {
+                    if (isListening) { // Only log if we were still supposed to be listening
+                        Log.e(TAG, "IOException in run loop on port " + port, e);
+                    }
+                    // Potentially set isListening = false here if error is critical
                 }
-            } catch (IOException e) {
-                e.printStackTrace();
             }
+        } finally {
+            Log.d(TAG, "MIDIPort run() finally block executing for port " + port);
+            if (selector != null && selector.isOpen()) {
+                try {
+                    selector.close();
+                    Log.d(TAG, "Selector closed for port " + port);
+                } catch (IOException e) {
+                    Log.e(TAG, "IOException while closing selector for port " + port, e);
+                }
+            }
+            if (channel != null && channel.isOpen()) {
+                try {
+                    channel.close();
+                    Log.d(TAG, "Channel closed for port " + port);
+                } catch (IOException e) {
+                    Log.e(TAG, "IOException while closing channel for port " + port, e);
+                }
+            }
+            Log.d(TAG, "Port " + port + " resources closed.");
         }
-
     }
 
     int getPort() {
@@ -144,7 +172,13 @@ class MIDIPort implements Runnable {
     }
 
     void stop() {
+        // This existing stop method just sets isListening to false.
+        // The new close() method is more comprehensive for resource cleanup.
+        // We can keep this for now, but ensure close() is called for actual cleanup.
         isListening = false;
+        if (selector != null && selector.isOpen()) {
+             selector.wakeup(); // Also wakeup selector here
+        }
     }
 
     private void handleRead(SelectionKey key) {
@@ -154,9 +188,13 @@ class MIDIPort implements Runnable {
         try {
             b.buffer.clear();
             b.socketAddress = c.receive(b.buffer);
-            EventBus.getDefault().post(new PacketEvent(new DatagramPacket(b.buffer.array(),b.buffer.capacity(),b.socketAddress)));
+            if (b.socketAddress != null) { // Ensure a packet was actually received
+                EventBus.getDefault().post(new PacketEvent(new DatagramPacket(b.buffer.array(),b.buffer.position(),b.socketAddress))); // Use position for length
+            } else {
+                Log.w(TAG, "receive() returned null on port " + port);
+            }
         } catch (IOException e) {
-            e.printStackTrace();
+            Log.e(TAG, "IOException in handleRead on port " + port, e);
         }
     }
 
@@ -166,10 +204,11 @@ class MIDIPort implements Runnable {
             try {
                 DatagramChannel c = (DatagramChannel) key.channel();
                 DatagramPacket d = outboundQueue.poll();
-
-                c.send(ByteBuffer.wrap(d.getData()),d.getSocketAddress());
+                if (d != null) {
+                    c.send(ByteBuffer.wrap(d.getData()), d.getSocketAddress());
+                }
             } catch (IOException e) {
-                e.printStackTrace();
+                Log.e(TAG, "IOException in handleWrite on port " + port, e);
             }
         }
     }
@@ -196,16 +235,19 @@ class MIDIPort implements Runnable {
     private void addToOutboundQueue(byte[] data, Bundle rinfo) {
         try {
             outboundQueue.add(new DatagramPacket(data, data.length, InetAddress.getByName(rinfo.getString(com.disappointedpig.midi.MIDIConstants.RINFO_ADDR)), rinfo.getInt(com.disappointedpig.midi.MIDIConstants.RINFO_PORT)));
-            selector.wakeup();
+            if (selector != null && selector.isOpen()) {
+                selector.wakeup();
+            }
         } catch (UnknownHostException e) {
-            e.printStackTrace();
+            Log.e(TAG, "UnknownHostException in addToOutboundQueue for port " + port, e);
+        } catch (Exception e) {
+            Log.e(TAG, "Exception in addToOutboundQueue for port " + port, e);
         }
     }
 
-    private class UDPBuffer {
-        DatagramPacket datagramPacket;
+    private static class UDPBuffer { // Made static as it doesn't need to access MIDIPort instance fields
+        // DatagramPacket datagramPacket; // This field was unused
         SocketAddress  socketAddress;
         ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
-
     }
 }
